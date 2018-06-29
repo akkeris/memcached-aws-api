@@ -6,15 +6,15 @@ import "github.com/martini-contrib/binding"
 import "github.com/aws/aws-sdk-go/aws"
 import "github.com/aws/aws-sdk-go/aws/session"
 import "github.com/aws/aws-sdk-go/service/elasticache"
-import "fmt"
+import "log"
 import "strconv"
+import "net/http"
 import "database/sql"
 import _ "github.com/lib/pq"
 import "os"
 import "net"
 import "strings"
 import "io/ioutil"
-import "encoding/json"
 
 type provisionspec struct {
 	Plan        string `json:"plan"`
@@ -32,357 +32,223 @@ type Stat struct {
 	Value string `json:"value"`
 }
 
-func tag(spec tagspec, berr binding.Errors, r render.Render) {
-	if berr != nil {
-		fmt.Println(berr)
-		errorout := make(map[string]interface{})
-		errorout["error"] = berr
-		r.JSON(500, errorout)
-		return
-	}
-	fmt.Println(spec.Resource)
-	fmt.Println(spec.Name)
-	fmt.Println(spec.Value)
-	svc := elasticache.New(session.New(&aws.Config{
-		Region: aws.String(os.Getenv("REGION")),
-	}))
-	region := os.Getenv("REGION")
-	accountnumber := os.Getenv("ACCOUNTNUMBER")
-	name := spec.Resource
-
-	arnname := "arn:aws:elasticache:" + region + ":" + accountnumber + ":cluster:" + name
-
-	params := &elasticache.AddTagsToResourceInput{
-		ResourceName: aws.String(arnname),
-		Tags: []*elasticache.Tag{ // Required
-			{
-				Key:   aws.String(spec.Name),
-				Value: aws.String(spec.Value),
-			},
-		},
-	}
-	resp, err := svc.AddTagsToResource(params)
-
-	if err != nil {
-		fmt.Println(err.Error())
-		errorout := make(map[string]interface{})
-		errorout["error"] = berr
-		r.JSON(500, errorout)
-		return
-	}
-
-	fmt.Println(resp)
-	r.JSON(200, map[string]interface{}{"response": "tag added"})
+type ErrorMessage struct {
+	Error string `json:"error"`
 }
 
-func provision(spec provisionspec, err binding.Errors, r render.Render) {
-	plan := spec.Plan
-	billingcode := spec.Billingcode
+func reportError(r render.Render, e string) {
+	log.Println("Error: " + e)
+	r.JSON(http.StatusInternalServerError, ErrorMessage{Error:e})
+}
 
-	brokerdb := os.Getenv("BROKERDB")
-	fmt.Println(brokerdb)
-	uri := brokerdb
-	db, dberr := sql.Open("postgres", uri)
-	if dberr != nil {
-		fmt.Println(dberr)
-		toreturn := dberr.Error()
-		r.JSON(500, map[string]interface{}{"error": toreturn})
-		return
-	}
-	var name string
-	dberr = db.QueryRow("select name from provision where plan='" + plan + "' and claimed='no' and make_date=(select min(make_date) from provision where plan='" + plan + "' and claimed='no')").Scan(&name)
+var region string
+var svc *elasticache.ElastiCache
 
-	if dberr != nil {
-		fmt.Println(dberr)
-		toreturn := dberr.Error()
-		r.JSON(500, map[string]interface{}{"error": toreturn})
-		return
-	}
-	fmt.Println(name)
-
-	stmt, dberr := db.Prepare("update provision set claimed=$1 where name=$2")
-
-	if dberr != nil {
-		fmt.Println(dberr)
-		toreturn := dberr.Error()
-		r.JSON(500, map[string]interface{}{"error": toreturn})
-		return
-	}
-	_, dberr = stmt.Exec("yes", name)
-	if dberr != nil {
-		fmt.Println(dberr)
-		toreturn := dberr.Error()
-		r.JSON(500, map[string]interface{}{"error": toreturn})
-		return
-	}
-
-	region := os.Getenv("REGION")
-	svc := elasticache.New(session.New(&aws.Config{
-		Region: aws.String(region),
-	}))
-	accountnumber := os.Getenv("ACCOUNTNUMBER")
-	arnname := "arn:aws:elasticache:" + region + ":" + accountnumber + ":cluster:" + name
-
-	params := &elasticache.AddTagsToResourceInput{
-		ResourceName: aws.String(arnname),
-		Tags: []*elasticache.Tag{ // Required
-			{
-				Key:   aws.String("billingcode"),
-				Value: aws.String(billingcode),
-			},
-		},
-	}
-	resp, awserr := svc.AddTagsToResource(params)
-
-	if awserr != nil {
-		fmt.Println(awserr.Error())
-		toreturn := awserr.Error()
-		r.JSON(500, map[string]interface{}{"error": toreturn})
-		return
-		return
-	}
-
-	fmt.Println(resp)
-	eparams := &elasticache.DescribeCacheClustersInput{
+func getMemcachedUrl(name string) (error, string) {
+	eresp, awserr := svc.DescribeCacheClusters(&elasticache.DescribeCacheClustersInput{
 		CacheClusterId:    aws.String(name),
 		MaxRecords:        aws.Int64(20),
 		ShowCacheNodeInfo: aws.Bool(true),
-	}
-	eresp, awserr := svc.DescribeCacheClusters(eparams)
+	})
 	if awserr != nil {
-		toreturn := awserr.Error()
-		r.JSON(500, map[string]interface{}{"error": toreturn})
-		return
+		return awserr, ""
 	}
 	endpointhost := *eresp.CacheClusters[0].CacheNodes[0].Endpoint.Address
-	endpointport := *eresp.CacheClusters[0].CacheNodes[0].Endpoint.Port
-	stringport := strconv.FormatInt(endpointport, 10)
-	r.JSON(200, map[string]string{"MEMCACHED_URL": endpointhost + ":" + stringport})
+	endpointport := strconv.FormatInt(*eresp.CacheClusters[0].CacheNodes[0].Endpoint.Port, 10)
+	return nil, endpointhost + ":" + endpointport
+}
 
+func tag(name string, key string, value string) (e error) { 
+	_, err := svc.AddTagsToResource(&elasticache.AddTagsToResourceInput{
+		ResourceName: aws.String("arn:aws:elasticache:" + region + ":" + os.Getenv("ACCOUNTNUMBER") + ":cluster:" + name),
+		Tags: []*elasticache.Tag{
+			{
+				Key:   aws.String(key),
+				Value: aws.String(value),
+			},
+		},
+	})
+	return err
+}
+
+func provision(db *sql.DB, plan string, billingcode string) (error, string) {
+	var name string
+	err := db.QueryRow("select name from provision where plan=$1 and claimed='no' and make_date=(select min(make_date) from provision where plan=$1 and claimed='no')", plan).Scan(&name)
+	if err != nil {
+		return err, ""
+	}
+	err = tag(name, "billingcode", billingcode)
+	if err != nil {
+		return err, ""
+	}
+	_, err = db.Exec("update provision set claimed=$1 where name=$2", "yes", name)
+	if err != nil {
+		return err, ""
+	}
+	return getMemcachedUrl(name)
+}
+
+func deprovision(db *sql.DB, name string) (error) {
+	_, err := svc.DeleteCacheCluster(&elasticache.DeleteCacheClusterInput{
+		CacheClusterId: aws.String(name),
+	})
+	if err != nil {
+		return err
+	}
+	_, err = db.Exec("delete from provision where name=$1", name)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func flushAll(name string) (r string, e error) {
+	err, memcached_url := getMemcachedUrl(name)
+	if err != nil {
+		return err.Error(), err
+	}
+	tcpAddr, err := net.ResolveTCPAddr("tcp4", memcached_url)
+	if err != nil {
+		return err.Error(), err
+	}
+	conn, err := net.DialTCP("tcp", nil, tcpAddr)
+	if err != nil {
+		return err.Error(), err
+	}
+	_, err = conn.Write([]byte("flush_all\n"))
+	conn.CloseWrite()
+	if err != nil {
+		return err.Error(), err
+	}
+	result, err := ioutil.ReadAll(conn)
+	if err != nil {
+		return err.Error(), err
+	}
+	trimmed := strings.TrimSpace(string(result))
+	return trimmed, nil
+}
+
+func getStats(name string) (s []Stat, e error) {
+	var stats []Stat
+	err, memcached_url := getMemcachedUrl(name)
+	if err != nil {
+		return stats, err
+	}
+	tcpAddr, err := net.ResolveTCPAddr("tcp4", memcached_url)
+	if err != nil {
+		return stats, err
+	}
+	conn, err := net.DialTCP("tcp", nil, tcpAddr)
+	if err != nil {
+		return stats, err
+	}
+	_, err = conn.Write([]byte("stats\n"))
+	conn.CloseWrite()
+	if err != nil {
+		return stats, err
+	}
+	result, err := ioutil.ReadAll(conn)
+	if err != nil {
+		return stats, err
+	}
+	resulta := strings.Split(string(result), "\n")
+	for _, element := range resulta {
+		if strings.HasPrefix(element, "STAT") {
+			var stat Stat
+			stata := strings.Split(element, " ")
+			stat.Key = stata[1]
+			t := strings.TrimSpace(stata[2])
+			stat.Value = t
+			stats = append(stats, stat)
+		}
+	}
+	return stats, nil
 }
 
 func main() {
-	region := os.Getenv("REGION")
-	svc := elasticache.New(session.New(&aws.Config{
+	if os.Getenv("ACCOUNTNUMBER") == "" {
+		log.Fatalln("The aws ACCOUNTNUMBER environment variable was not set and is required.")
+	}
+	if os.Getenv("BROKERDB") == "" {
+		log.Fatalln("The postgres broker database is required for this to run as environment BROKERDB in the format postgres://...")
+	}
+	if os.Getenv("REGION") == "" {
+		log.Fatalln("The REGION environment variable is not defined, it should contain the AWS region (e.g., us-west-2).")
+	}
+	db, dberr := sql.Open("postgres", os.Getenv("BROKERDB"))
+	if dberr != nil {
+		log.Fatalln(dberr.Error())
+		return
+	}
+	region = os.Getenv("REGION")
+	svc = elasticache.New(session.New(&aws.Config{
 		Region: aws.String(region),
 	}))
-
 	m := martini.Classic()
 	m.Use(render.Renderer())
 
-	m.Post("/v1/memcached/instance", binding.Json(provisionspec{}), provision)
-
+	m.Post("/v1/memcached/instance", binding.Json(provisionspec{}), func (spec provisionspec, berr binding.Errors, r render.Render) {
+		if berr != nil {
+			r.JSON(400, "Malformed request")
+			return
+		}
+		err, memcached_url := provision(db, spec.Plan, spec.Billingcode)
+		if err != nil {
+			reportError(r, err.Error())
+			return
+		}
+		r.JSON(http.StatusOK, map[string]string{"MEMCACHED_URL":memcached_url})
+	})
 	m.Delete("/v1/memcached/instance/:name", func(params martini.Params, r render.Render) {
-		name := params["name"]
-		dparams := &elasticache.DeleteCacheClusterInput{
-			CacheClusterId: aws.String(name), // Required
-		}
-		dresp, derr := svc.DeleteCacheCluster(dparams)
-
-		if derr != nil {
-			fmt.Println(derr.Error())
-			errorout := make(map[string]interface{})
-			errorout["error"] = derr.Error()
-			r.JSON(500, errorout)
-			return
-		}
-		brokerdb := os.Getenv("BROKERDB")
-		fmt.Println(brokerdb)
-		uri := brokerdb
-		db, dberr := sql.Open("postgres", uri)
-		if dberr != nil {
-			fmt.Println(dberr)
-			toreturn := dberr.Error()
-			r.JSON(500, map[string]interface{}{"error": toreturn})
-			return
-		}
-
-		fmt.Println("# Deleting")
-		stmt, err := db.Prepare("delete from provision where name=$1")
+		err := deprovision(db, params["name"])
 		if err != nil {
-			errorout := make(map[string]interface{})
-			errorout["error"] = err.Error()
-			r.JSON(500, errorout)
+			reportError(r, err.Error())
 			return
 		}
-		res, err := stmt.Exec(name)
-		if err != nil {
-			errorout := make(map[string]interface{})
-			errorout["error"] = err.Error()
-			r.JSON(500, errorout)
-			return
-		}
-		affect, err := res.RowsAffected()
-		if err != nil {
-			errorout := make(map[string]interface{})
-			errorout["error"] = err.Error()
-			r.JSON(500, errorout)
-			return
-		}
-		fmt.Println(affect, "rows changed")
-		r.JSON(200, dresp)
+		r.JSON(http.StatusOK, map[string]interface{}{"response":"memcached removed"})
 	})
 	m.Get("/v1/memcached/plans", func(r render.Render) {
 		plans := make(map[string]interface{})
 		plans["small"] = "Small - 1x CPU - 0.6 GB "
 		plans["medium"] = "Medium - 2x CPU - 3.2 GB"
 		plans["large"] = "Large - 2x CPU 6 GB"
-		r.JSON(200, plans)
+		r.JSON(http.StatusOK, plans)
 	})
-
 	m.Get("/v1/memcached/url/:name", func(params martini.Params, r render.Render) {
-		name := params["name"]
-		eparams := &elasticache.DescribeCacheClustersInput{
-			CacheClusterId:    aws.String(name),
-			MaxRecords:        aws.Int64(20),
-			ShowCacheNodeInfo: aws.Bool(true),
-		}
-		resp, err := svc.DescribeCacheClusters(eparams)
+		err, memcached_url := getMemcachedUrl(params["name"])
 		if err != nil {
-			toreturn := err.Error()
-			r.JSON(200, map[string]interface{}{"error": toreturn})
+			reportError(r, err.Error())
 			return
 		}
-		endpointhost := *resp.CacheClusters[0].CacheNodes[0].Endpoint.Address
-		endpointport := *resp.CacheClusters[0].CacheNodes[0].Endpoint.Port
-		stringport := strconv.FormatInt(endpointport, 10)
-		r.JSON(200, map[string]string{"MEMCACHED_URL": endpointhost + ":" + stringport})
+		r.JSON(http.StatusOK, map[string]string{"MEMCACHED_URL":memcached_url})
 	})
-	m.Post("/v1/tag", binding.Json(tagspec{}), tag)
-	m.Get("/v1/memcached/operations/stats/:name", GetStats)
-	m.Delete("/v1/memcached/operations/cache/:name", FlushAll)
-
-	m.Run()
-}
-
-func GetStats(params martini.Params, r render.Render) {
-	stats, err := getstats(params["name"])
-	if err != nil {
-		fmt.Println(err)
-		r.JSON(500, err)
-	}
-	r.JSON(200, stats)
-}
-func FlushAll(params martini.Params, r render.Render) {
-
-	result, err := flushall(params["name"])
-	if err != nil {
-		fmt.Println(err)
-		r.JSON(500, map[string]string{"flush_all": err.Error()})
-	}
-	r.JSON(200, map[string]string{"flush_all": result})
-}
-
-func flushall(name string) (r string, e error) {
-	svc := elasticache.New(session.New(&aws.Config{
-		Region: aws.String(os.Getenv("REGION")),
-	}))
-	eparams := &elasticache.DescribeCacheClustersInput{
-		CacheClusterId:    aws.String(name),
-		MaxRecords:        aws.Int64(20),
-		ShowCacheNodeInfo: aws.Bool(true),
-	}
-	resp, err := svc.DescribeCacheClusters(eparams)
-	if err != nil {
-		fmt.Println(err)
-		return err.Error(), err
-	}
-	endpointhost := *resp.CacheClusters[0].CacheNodes[0].Endpoint.Address
-	endpointport := *resp.CacheClusters[0].CacheNodes[0].Endpoint.Port
-	stringport := strconv.FormatInt(endpointport, 10)
-	fmt.Println(endpointhost + ":" + stringport)
-	tcpAddr, err := net.ResolveTCPAddr("tcp4", endpointhost+":"+stringport)
-	if err != nil {
-		fmt.Println(err)
-		return err.Error(), err
-	}
-	conn, err := net.DialTCP("tcp", nil, tcpAddr)
-	if err != nil {
-		fmt.Println(err)
-		return err.Error(), err
-	}
-	_, err = conn.Write([]byte("flush_all\n"))
-	conn.CloseWrite()
-	if err != nil {
-		fmt.Println(err)
-		return err.Error(), err
-	}
-	result, err := ioutil.ReadAll(conn)
-	fmt.Println(string(result))
-	if err != nil {
-		fmt.Println(err)
-		return err.Error(), err
-	}
-	trimmed := strings.TrimSpace(string(result))
-	return trimmed, nil
-
-}
-func getstats(name string) (s []Stat, e error) {
-	var stats []Stat
-	svc := elasticache.New(session.New(&aws.Config{
-		Region: aws.String(os.Getenv("REGION")),
-	}))
-	eparams := &elasticache.DescribeCacheClustersInput{
-		CacheClusterId:    aws.String(name),
-		MaxRecords:        aws.Int64(20),
-		ShowCacheNodeInfo: aws.Bool(true),
-	}
-	resp, err := svc.DescribeCacheClusters(eparams)
-	if err != nil {
-		fmt.Println(err)
-		return stats, err
-	}
-	endpointhost := *resp.CacheClusters[0].CacheNodes[0].Endpoint.Address
-	endpointport := *resp.CacheClusters[0].CacheNodes[0].Endpoint.Port
-	stringport := strconv.FormatInt(endpointport, 10)
-	fmt.Println(endpointhost + ":" + stringport)
-
-	tcpAddr, err := net.ResolveTCPAddr("tcp4", endpointhost+":"+stringport)
-	if err != nil {
-		fmt.Println(err)
-		return stats, err
-	}
-	conn, err := net.DialTCP("tcp", nil, tcpAddr)
-	if err != nil {
-		fmt.Println(err)
-		return stats, err
-	}
-	_, err = conn.Write([]byte("stats\n"))
-	conn.CloseWrite()
-	if err != nil {
-		fmt.Println(err)
-		return stats, err
-	}
-	var resulta []string
-	result, err := ioutil.ReadAll(conn)
-	if err != nil {
-		fmt.Println(err)
-		return stats, err
-	}
-	resulta = strings.Split(string(result), "\n")
-	for _, element := range resulta {
-		if strings.HasPrefix(element, "STAT") {
-			//fmt.Println(element)
-			var stat Stat
-			stata := strings.Split(element, " ")
-			//fmt.Println(stata[0])
-			//fmt.Println(stata[1])
-			//fmt.Println(stata[2])
-			stat.Key = stata[1]
-			t := strings.TrimSpace(stata[2])
-
-			stat.Value = t
-			//fmt.Println(stat)
-			stats = append(stats, stat)
+	m.Post("/v1/tag", binding.Json(tagspec{}), func (spec tagspec, berr binding.Errors, r render.Render) {
+		if berr != nil {
+			r.JSON(400, "Malformed request")
+			return
 		}
-	}
-	b, err := json.Marshal(stats)
-	if err != nil {
-		fmt.Printf("Error: %s", err)
-		return stats, err
-	}
-
-	fmt.Println(string(b))
-	return stats, nil
-
+		err := tag(spec.Resource, spec.Name, spec.Value)
+		if err != nil {
+			reportError(r, err.Error())
+			return
+		}
+		r.JSON(http.StatusOK, map[string]interface{}{"response": "tag added"})
+	})
+	m.Get("/v1/memcached/operations/stats/:name", func (params martini.Params, r render.Render) {
+		stats, err := getStats(params["name"])
+		if err != nil {
+			reportError(r, err.Error())
+			return
+		}
+		r.JSON(http.StatusOK, stats)
+	})
+	m.Delete("/v1/memcached/operations/cache/:name", func (params martini.Params, r render.Render) {
+		result, err := flushAll(params["name"])
+		if err != nil {
+			reportError(r, err.Error())
+			return
+		}
+		r.JSON(http.StatusOK, map[string]string{"flush_all": result})
+	})
+	m.Run()
 }

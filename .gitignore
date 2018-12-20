@@ -1,2 +1,6 @@
 .env
 memcached-aws-api
+env.maru
+exports.sh
+maru.sh
+
